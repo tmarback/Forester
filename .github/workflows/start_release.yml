@@ -1,0 +1,113 @@
+# Workflow for creating release branches when a version project is closed
+
+name: Start Release
+
+on:
+  project:
+    types:
+      - closed
+
+jobs:
+  start:
+    name: Start Release
+    runs-on: ubuntu-latest
+    if: startsWith( github.event.project.name, 'v' ) # Only version projects
+    steps:
+      # Get associated milestone
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: 3.8
+      - name: Install dependencies
+        run: python -m pip install requests
+      - name: Fetch scripts # Don't need whole repository, just these files
+        run: |
+          wget https://github.com/${{ github.repository }}/raw/master/.github/scripts/get_milestone_number.py
+          wget https://github.com/${{ github.repository }}/raw/master/.github/scripts/get_milestone_open_issues.py
+      - name: Get milestone number
+        id: get_number
+        run: | 
+          number=$( python get_milestone_number.py ${{ github.event.project.name }} open )
+          echo "::set-output name=number::${number}"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      # Check no issues remain open in the milestone
+      - name: Get open issues in milestone
+        id: get_open_issues
+        run: | 
+          number=$( python get_milestone_open_issues.py ${{ steps.get_number.outputs.number }} )
+          echo "::set-output name=number::${number}"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Check no open issues
+        run: |
+          [[ ${{ steps.get_open_issues.outputs.number }} == 0 ]]
+
+      # Check develop branch builds and passes
+      - name: Check out Git repository
+        uses: actions/checkout@v2
+        with:
+          ref: develop # Release starts from develop
+      - name: Set up Java and Maven
+        uses: actions/setup-java@v1
+        with:
+          java-version: 11
+      - name: Build and test with Maven
+        run: mvn clean install -B # Also installs artifact for Checker
+
+      # Run linters and style checkers
+      - name: Run linter/static checker
+        run: mvn compile -B -P lint,strict
+      - name: Run style checks
+        run: mvn validate -B -P style,strict
+
+      # Create release branch
+      - name: Configure git commiter identity
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+      - name: Start release branch
+        run: mvn gitflow:release-start -B
+
+      # Generate release notes
+      - name: Get release note program
+        run: wget -O github-release-notes-generator.jar https://github.com/spring-io/github-release-notes-generator/releases/download/v0.0.2/github-release-notes-generator.jar
+      - name: Create release notes
+        run: |
+          java -jar github-release-notes-generator.jar \
+                --releasenotes.github.organization=${{ github.repository_owner }} \
+                --releasenotes.github.repository=${{ github.event.repository.name }} \
+                --releasenotes.github.username=${{ github.actor }} \
+                --releasenotes.github.password=${{ github.token }} \
+                --spring.config.location=.github/release-notes.yml \
+                ${{ steps.get_number.outputs.number }} \
+                release_notes.md
+      - name: Commit release notes
+        run: |
+          git add release_notes.md
+          git commit -m "Generated release notes."
+      
+      - name: Push release branch
+        run: git push origin HEAD
+
+      - name: Close milestone
+        run: |
+          response=$( curl -X PATCH --write-out '%{http_code}' --silent --output /dev/null \
+               -H "Accept: application/vnd.github.v3+json" \
+               -H "Authorization: token ${{ github.token }}" \
+               https://api.github.com/repos/${{ github.repository }}/milestones/${{ steps.get_number.outputs.number }} \
+               -d '{"state": "closed"}' )
+          echo "Response code: ${response}"
+          [[ ${response} == 200 ]]
+
+      - name: Abort project close
+        if: failure()
+        run: |
+          response=$( curl -X PATCH --write-out '%{http_code}' --silent --output /dev/null \
+               -H "Accept: application/vnd.github.inertia-preview+json" \
+               -H "Authorization: token ${{ github.token }}" \
+               ${{ github.event.project.url }} \
+               -d '{"state": "open"}' )
+          echo "Response code: ${response}"
+          [[ ${response} == 200 ]]
